@@ -30,6 +30,8 @@ import google.generativeai as genai
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from dotenv import load_dotenv
+load_dotenv()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -273,7 +275,7 @@ RULES:
 
 
 def call_gemini(api_key: str, context: str, section_instruction: str,
-                word_limit: int, model_name: str = "gemini-1.5-flash") -> str:
+                word_limit: int, model_name: str = "gemini-2.5-flash") -> str:
     """Call Gemini and return the generated text for one MS section."""
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
