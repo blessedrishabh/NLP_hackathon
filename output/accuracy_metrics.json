@@ -1,12 +1,62 @@
 {
-  "purpose": 0.0,
-  "scope": 0.2,
-  "acronyms": 0.5,
-  "references": 0.0,
-  "procedure": 0.281,
-  "equipment": 0.267,
-  "personnel": 0.5,
-  "quality": 0.0,
-  "health_safety": 0.0,
-  "other": 0.0
+  "purpose": {
+    "score": 0.0789,
+    "n_chunks": 12,
+    "n_table_chunks": 2,
+    "best_chunk": "5.1.2.1"
+  },
+  "scope": {
+    "score": 0.0566,
+    "n_chunks": 13,
+    "n_table_chunks": 4,
+    "best_chunk": "5.4.3.3"
+  },
+  "acronyms": {
+    "score": 0.1093,
+    "n_chunks": 10,
+    "n_table_chunks": 0,
+    "best_chunk": "5.9.7.4"
+  },
+  "references": {
+    "score": 0.0452,
+    "n_chunks": 11,
+    "n_table_chunks": 2,
+    "best_chunk": "4.1.2"
+  },
+  "procedure": {
+    "score": 0.0729,
+    "n_chunks": 36,
+    "n_table_chunks": 4,
+    "best_chunk": "4.2.5"
+  },
+  "equipment": {
+    "score": 0.1144,
+    "n_chunks": 16,
+    "n_table_chunks": 1,
+    "best_chunk": "5.2.3.3"
+  },
+  "personnel": {
+    "score": 0.1022,
+    "n_chunks": 11,
+    "n_table_chunks": 2,
+    "best_chunk": "5.9.7.6"
+  },
+  "quality": {
+    "score": 0.0905,
+    "n_chunks": 16,
+    "n_table_chunks": 3,
+    "best_chunk": "5.11.5"
+  },
+  "health_safety": {
+    "score": 0.0525,
+    "n_chunks": 7,
+    "n_table_chunks": 2,
+    "best_chunk": "4.2.14.1.1"
+  },
+  "other": {
+    "score": 0.1079,
+    "n_chunks": 19,
+    "n_table_chunks": 4,
+    "best_chunk": "5.8.3.6"
+  }
 }

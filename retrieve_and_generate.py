@@ -205,55 +205,191 @@ def load_vector_store(db_dir: str):
     return collection
 
 
+def _query_collection(collection, embedding: list,
+                      n_results: int,
+                      chunk_type_filter: str | None = None) -> list[tuple]:
+    """
+    Single ChromaDB query.  Returns list of (id, doc, meta, distance).
+    Optionally filters to a specific chunk_type ("section" or "table").
+    Drops results whose cosine distance exceeds the relevance threshold.
+    """
+    DISTANCE_THRESHOLD = 1.2   # cosine distance: lower = more similar (0 = identical)
+
+    kwargs = dict(
+        query_embeddings=embedding,
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"],
+    )
+    if chunk_type_filter:
+        kwargs["where"] = {"chunk_type": chunk_type_filter}
+
+    try:
+        res = collection.query(**kwargs)
+    except Exception:
+        # ChromaDB raises if the filtered subset is smaller than n_results
+        kwargs["n_results"] = 1
+        try:
+            res = collection.query(**kwargs)
+        except Exception:
+            return []
+
+    rows = []
+    for doc, meta, cid, dist in zip(
+        res["documents"][0],
+        res["metadatas"][0],
+        res["ids"][0],
+        res["distances"][0],
+    ):
+        if dist <= DISTANCE_THRESHOLD:
+            rows.append((cid, doc, meta, dist))
+    return rows
+
+
 def retrieve_chunks(collection, model: SentenceTransformer,
                     queries: list[str], n_per_query: int = 5) -> list[dict]:
     """
-    Run multiple queries against ChromaDB and return a de-duplicated list
-    of chunks ordered by first-encountered relevance.
+    Two-pass retrieval — table-aware:
+
+    Pass 1 (prose): query without chunk_type filter → catches section prose.
+    Pass 2 (table): same queries restricted to chunk_type="table" → ensures
+                    structured table data is always considered, not crowded out
+                    by prose chunks that happen to score slightly higher.
+
+    Results from both passes are merged, de-duplicated by ID, and sorted by
+    ascending distance (most relevant first).
     """
     seen_ids: set[str] = set()
-    results: list[dict] = []
+    raw: list[tuple] = []   # (id, doc, meta, distance)
 
     for query in queries:
         embedding = model.encode([query]).tolist()
-        res = collection.query(
-            query_embeddings=embedding,
-            n_results=n_per_query,
-            include=["documents", "metadatas", "distances"],
-        )
-        docs      = res["documents"][0]
-        metadatas = res["metadatas"][0]
-        ids       = res["ids"][0]
 
-        for doc, meta, chunk_id in zip(docs, metadatas, ids):
-            if chunk_id not in seen_ids:
-                seen_ids.add(chunk_id)
-                results.append({
-                    "id":      chunk_id,
-                    "section": meta.get("section", ""),
-                    "title":   meta.get("title", ""),
-                    "text":    doc,
-                })
+        # Pass 1 — prose + table (unfiltered)
+        for row in _query_collection(collection, embedding, n_per_query):
+            if row[0] not in seen_ids:
+                seen_ids.add(row[0])
+                raw.append(row)
 
-    return results
+        # Pass 2 — tables only (guarantees at least some table chunks surface)
+        for row in _query_collection(collection, embedding,
+                                     max(2, n_per_query // 2),
+                                     chunk_type_filter="table"):
+            if row[0] not in seen_ids:
+                seen_ids.add(row[0])
+                raw.append(row)
+
+    # Sort by relevance (lowest distance = best match)
+    raw.sort(key=lambda r: r[3])
+
+    return [
+        {
+            "id":         cid,
+            "section":    meta.get("section", ""),
+            "title":      meta.get("title", ""),
+            "chunk_type": meta.get("chunk_type", "section"),
+            "table_id":   meta.get("table_id", ""),
+            "text":       doc,
+            "distance":   round(dist, 4),
+        }
+        for cid, doc, meta, dist in raw
+    ]
 
 
-def chunks_to_context(chunks: list[dict], max_chars: int = 8000) -> str:
+def pipe_to_markdown_table(text: str) -> str:
     """
-    Serialise retrieved chunks into a numbered context string.
-    Truncates at max_chars to stay within LLM context limits.
+    Convert the pipe-delimited table text produced by embed_and_store into a
+    proper markdown table the LLM can reason over accurately.
+
+    Input (first line is caption, rest are data rows):
+        Table 4.1 Graded Stone Aggregate
+        IS Sieve Designation | 40 mm | 20 mm | 16 mm
+        80 mm | 100 | - | -
+
+    Output:
+        **Table 4.1 Graded Stone Aggregate**
+        | IS Sieve Designation | 40 mm | 20 mm | 16 mm |
+        |---|---|---|---|
+        | 80 mm | 100 | - | - |
     """
-    lines = []
-    total = 0
+    lines = [l for l in text.strip().splitlines() if l.strip()]
+    if not lines:
+        return text
+
+    out = []
+    data_lines = []
+    caption    = ""
+
+    # First line: check if it's a caption (no pipe) or a data row
+    if "|" not in lines[0]:
+        caption    = lines[0].strip()
+        data_lines = lines[1:]
+    else:
+        data_lines = lines
+
+    if caption:
+        out.append(f"**{caption}**")
+
+    if not data_lines:
+        return "\n".join(out)
+
+    # Build markdown table
+    def _row(cells):
+        return "| " + " | ".join(c.strip() for c in cells) + " |"
+
+    header_cells = data_lines[0].split("|")
+    out.append(_row(header_cells))
+    out.append("| " + " | ".join("---" for _ in header_cells) + " |")  # separator
+
+    for row in data_lines[1:]:
+        out.append(_row(row.split("|")))
+
+    return "\n".join(out)
+
+
+def chunks_to_context(chunks: list[dict], max_chars: int = 10000) -> str:
+    """
+    Serialise retrieved chunks into a context string for the LLM.
+
+    Improvements over v1:
+    - Prose chunks and table chunks are formatted differently
+    - Table chunks are rendered as markdown tables (not raw pipe text)
+    - Prose and table sections are grouped with clear headers so the LLM
+      knows what kind of content it is reading
+    - Hard truncation replaced by per-chunk budget check so the most
+      relevant chunks (sorted by distance) always appear first
+    """
+    prose_blocks = []
+    table_blocks = []
+    total_chars  = 0
+
     for i, c in enumerate(chunks, 1):
-        header = f"[{i}] Section {c['section']} — {c['title']}"
-        body   = c["text"].strip()
-        block  = f"{header}\n{body}\n"
-        if total + len(block) > max_chars:
+        chunk_type = c.get("chunk_type", "section")
+        header     = f"[{i}] §{c['section']} — {c['title']}"
+
+        if chunk_type == "table":
+            table_label = c.get("table_id", "")
+            body = pipe_to_markdown_table(c["text"])
+            block = f"{header}\n{body}\n"
+        else:
+            block = f"{header}\n{c['text'].strip()}\n"
+
+        if total_chars + len(block) > max_chars:
             break
-        lines.append(block)
-        total += len(block)
-    return "\n".join(lines)
+
+        if chunk_type == "table":
+            table_blocks.append(block)
+        else:
+            prose_blocks.append(block)
+
+        total_chars += len(block)
+
+    parts = []
+    if prose_blocks:
+        parts.append("=== SPECIFICATION TEXT ===\n" + "\n".join(prose_blocks))
+    if table_blocks:
+        parts.append("=== SPECIFICATION TABLES ===\n" + "\n".join(table_blocks))
+
+    return "\n\n".join(parts)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -271,6 +407,11 @@ RULES:
 3. Do NOT hallucinate values, codes, or requirements.
 4. Be concise and professional.
 5. Cite the specification section number (e.g. "per §4.1.2") wherever possible.
+6. The context contains two blocks:
+   - SPECIFICATION TEXT  : prose paragraphs from the spec
+   - SPECIFICATION TABLES: data tables in markdown format
+   When referencing table values (sieve sizes, mix ratios, % passing etc.)
+   read the column header and row label carefully before quoting a number.
 """
 
 
@@ -381,19 +522,69 @@ def build_word_document(sections_content: dict[str, str],
 def compute_retrieval_coverage(sections_content: dict[str, str],
                                 retrieved_chunks: dict[str, list[dict]]) -> dict:
     """
-    Simple coverage metric:
-      For each section, count how many retrieved chunk titles appear
-      (case-insensitive) in the generated text.  Reports a 0-1 score.
+    Coverage metric v2 — token overlap (Jaccard similarity).
+
+    The old metric checked whether a chunk's *title* appeared verbatim in the
+    generated text, which almost never matched and produced near-zero scores
+    for every section.
+
+    This version tokenises both the generated text and each retrieved chunk's
+    body, then computes:
+
+        Jaccard = |generated_tokens ∩ chunk_tokens| / |generated_tokens ∪ chunk_tokens|
+
+    The section score is the *mean* Jaccard across its retrieved chunks.
+    Score range: 0 (no word overlap) → 1 (identical vocabulary).
+
+    Additional per-section diagnostics:
+        n_chunks        – how many chunks were retrieved
+        n_table_chunks  – how many were table chunks
+        best_chunk      – section ID of the most-overlapping chunk
     """
+    def tokenise(text: str) -> set[str]:
+        # lowercase alphanum tokens, ignore stopwords and single chars
+        STOPWORDS = {"the", "a", "an", "of", "in", "to", "and", "or",
+                     "is", "are", "be", "as", "for", "with", "by", "on",
+                     "at", "from", "it", "its", "not", "per", "shall"}
+        tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
+        return tokens - STOPWORDS - {t for t in tokens if len(t) <= 1}
+
+    def jaccard(set_a: set, set_b: set) -> float:
+        if not set_a or not set_b:
+            return 0.0
+        inter = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return round(inter / union, 4) if union else 0.0
+
     scores = {}
     for key, chunks in retrieved_chunks.items():
-        text   = sections_content.get(key, "").lower()
-        titles = [c["title"].lower() for c in chunks if c["title"]]
-        if not titles:
-            scores[key] = None
+        gen_tokens = tokenise(sections_content.get(key, ""))
+        if not chunks:
+            scores[key] = {"score": None, "n_chunks": 0,
+                           "n_table_chunks": 0, "best_chunk": None}
             continue
-        hits = sum(1 for t in titles if t and t in text)
-        scores[key] = round(hits / len(titles), 3)
+
+        jaccard_scores = []
+        best_score, best_chunk = -1, None
+
+        for c in chunks:
+            chunk_tokens = tokenise(c["text"])
+            j = jaccard(gen_tokens, chunk_tokens)
+            jaccard_scores.append(j)
+            if j > best_score:
+                best_score = j
+                best_chunk = c["section"]
+
+        mean_score = round(sum(jaccard_scores) / len(jaccard_scores), 4)
+        n_table    = sum(1 for c in chunks if c.get("chunk_type") == "table")
+
+        scores[key] = {
+            "score"        : mean_score,
+            "n_chunks"     : len(chunks),
+            "n_table_chunks": n_table,
+            "best_chunk"   : best_chunk,
+        }
+
     return scores
 
 
@@ -462,9 +653,14 @@ def run_pipeline(db_dir: str, api_key: str, out_dir: str,
 
     # ── Accuracy metric ───────────────────────────────────────────────────
     scores = compute_retrieval_coverage(sections_content, all_retrieved)
-    print("\n📊  Retrieval-coverage scores (0 = no overlap, 1 = full overlap):")
+    print("\n📊  Retrieval-coverage scores (Jaccard token overlap, 0→1):")
     for k, v in scores.items():
-        print(f"    {k:<15}: {v}")
+        if v["score"] is None:
+            print(f"    {k:<15}: no chunks")
+        else:
+            print(f"    {k:<15}: {v['score']:.4f}  "
+                  f"(chunks={v['n_chunks']}, tables={v['n_table_chunks']}, "
+                  f"best=§{v['best_chunk']})")
     metric_path = os.path.join(out_dir, "accuracy_metrics.json")
     with open(metric_path, "w") as f:
         json.dump(scores, f, indent=2)
