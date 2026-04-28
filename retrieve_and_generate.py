@@ -31,6 +31,7 @@ from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from dotenv import load_dotenv
+from sentence_transformers import CrossEncoder
 load_dotenv()
 
 
@@ -245,19 +246,10 @@ def _query_collection(collection, embedding: list,
     return rows
 
 
+
 def retrieve_chunks(collection, model: SentenceTransformer,
                     queries: list[str], n_per_query: int = 5) -> list[dict]:
-    """
-    Two-pass retrieval — table-aware:
 
-    Pass 1 (prose): query without chunk_type filter → catches section prose.
-    Pass 2 (table): same queries restricted to chunk_type="table" → ensures
-                    structured table data is always considered, not crowded out
-                    by prose chunks that happen to score slightly higher.
-
-    Results from both passes are merged, de-duplicated by ID, and sorted by
-    ascending distance (most relevant first).
-    """
     seen_ids: set[str] = set()
     raw: list[tuple] = []   # (id, doc, meta, distance)
 
@@ -270,7 +262,7 @@ def retrieve_chunks(collection, model: SentenceTransformer,
                 seen_ids.add(row[0])
                 raw.append(row)
 
-        # Pass 2 — tables only (guarantees at least some table chunks surface)
+        # Pass 2 — tables only
         for row in _query_collection(collection, embedding,
                                      max(2, n_per_query // 2),
                                      chunk_type_filter="table"):
@@ -278,9 +270,24 @@ def retrieve_chunks(collection, model: SentenceTransformer,
                 seen_ids.add(row[0])
                 raw.append(row)
 
-    # Sort by relevance (lowest distance = best match)
-    raw.sort(key=lambda r: r[3])
+    # ── Reranking ─────────────────────────────────────────────
+    reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
+    combined_query = " ".join(queries)
+    pairs = [(combined_query, row[1]) for row in raw]
+
+    scores = reranker.predict(pairs)
+
+    # Attach scores
+    raw = [(*row, scores[i]) for i, row in enumerate(raw)]
+
+    # Sort by reranker score (descending)
+    raw.sort(key=lambda r: r[4], reverse=True)
+
+    # Optional: keep top-k after reranking
+    raw = raw[:10]
+
+    # ── Final output ───────────────────────────────────────────
     return [
         {
             "id":         cid,
@@ -291,7 +298,7 @@ def retrieve_chunks(collection, model: SentenceTransformer,
             "text":       doc,
             "distance":   round(dist, 4),
         }
-        for cid, doc, meta, dist in raw
+        for cid, doc, meta, dist, _ in raw
     ]
 
 

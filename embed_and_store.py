@@ -1,13 +1,7 @@
 """
-embed_and_store.py  (v2)
+embed_and_store.py  (v3)
 ========================
-Improvements over v1:
-- Tables are embedded as SEPARATE chunks (not silently dropped)
-- Table rows are serialised to readable pipe-delimited text so the embedding
-  model can understand column relationships (e.g. "IS Sieve 10mm | 25 to 55")
-- Section text chunks no longer contain raw table noise
-- Metadata is richer: chunk_type, has_tables, table_id
-- Duplicate-safe: uses upsert with stable deterministic IDs
++ Added section classification (label) for smarter retrieval
 """
 
 import os
@@ -23,23 +17,12 @@ import chromadb
 # ---------------------------------------------------------------------------
 
 def table_to_text(table: dict) -> str:
-    """
-    Convert a structured table dict into readable pipe-delimited text.
-
-    Example output:
-        Table 4.1 - Graded Stone Aggregate or Gravel
-        IS Sieve Designation | 40 mm | 20 mm | 16 mm | 12.5 mm
-        80 mm | 100 | - | - | -
-        40 mm | 95 to 100 | 100 | - | -
-        ...
-    """
     lines = []
     table_id = table.get("table_id", "Table")
-    lines.append(table_id)                          # caption as first line
+    lines.append(table_id)
 
     rows = table.get("data", [])
     for row in rows:
-        # Skip rows that are entirely empty
         if not any(str(c).strip() for c in row):
             continue
         lines.append(" | ".join(str(c).strip() for c in row))
@@ -48,7 +31,6 @@ def table_to_text(table: dict) -> str:
 
 
 def make_section_text(section: dict) -> str:
-    """Plain text for a section chunk (title + prose, NO table rows)."""
     parts = [section["title"]]
     if section.get("content"):
         parts.append(section["content"])
@@ -56,8 +38,28 @@ def make_section_text(section: dict) -> str:
 
 
 def make_safe_id(raw: str) -> str:
-    """ChromaDB requires IDs with no special chars beyond hyphens/underscores."""
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", raw)
+
+
+# ---------------------------------------------------------------------------
+# NEW: Section classifier
+# ---------------------------------------------------------------------------
+
+def classify_section(title: str, content: str) -> str:
+    text = (title + " " + content).lower()
+
+    if any(x in text for x in ["mix", "batch", "curing", "compaction", "placing"]):
+        return "procedure"
+    if any(x in text for x in ["equipment", "mixer", "vibrator", "pump"]):
+        return "equipment"
+    if any(x in text for x in ["test", "strength", "quality", "cube"]):
+        return "quality"
+    if any(x in text for x in ["is code", "bis", "standard", "specification"]):
+        return "references"
+    if any(x in text for x in ["safety", "ppe", "hazard"]):
+        return "health_safety"
+
+    return "other"
 
 
 # ---------------------------------------------------------------------------
@@ -65,22 +67,8 @@ def make_safe_id(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 def build_chunks(sections: list[dict]) -> list[dict]:
-    """
-    Returns a flat list of chunks, each with:
-        id          – stable string ID for ChromaDB upsert
-        text        – what gets embedded
-        metadata    – stored alongside the vector
-
-    Two chunk types:
-        "section"  – prose text of a section
-        "table"    – one table belonging to a section
-
-    IDs are prefixed with a zero-padded global counter so they are always
-    unique, even when two section IDs normalise to the same safe string
-    (e.g. "5.0" and "5-0" both become "5_0" after sanitisation).
-    """
     chunks = []
-    counter = 0   # monotonically increasing, guarantees no collisions
+    counter = 0
 
     def next_id(label: str) -> str:
         nonlocal counter
@@ -89,49 +77,53 @@ def build_chunks(sections: list[dict]) -> list[dict]:
         return uid
 
     for section in sections:
-        sec_id    = section.get("section", "")
-        title     = section.get("title", "")
-        parent    = str(section.get("parent") or "")
-        tables    = section.get("tables") or []
-        has_tbl   = len(tables) > 0
+        sec_id  = section.get("section", "")
+        title   = section.get("title", "")
+        content = section.get("content", "")
+        parent  = str(section.get("parent") or "")
+        tables  = section.get("tables") or []
+        has_tbl = len(tables) > 0
 
-        # ---- 1. Section prose chunk ----------------------------------------
+        # 🔹 classify once per section
+        label = classify_section(title, content)
+
+        # ---- 1. Section chunk --------------------------------------------
         sec_text = make_section_text(section)
         if sec_text.strip():
             chunks.append({
-                "id"  : next_id(f"sec_{sec_id}"),
+                "id": next_id(f"sec_{sec_id}"),
                 "text": sec_text,
                 "metadata": {
                     "chunk_type": "section",
-                    "section"   : sec_id,
-                    "title"     : title,
-                    "parent"    : parent,
-                    "has_tables": str(has_tbl),   # ChromaDB metadata must be str/int/float
+                    "section": sec_id,
+                    "title": title,
+                    "parent": parent,
+                    "has_tables": str(has_tbl),
+                    "label": label,   # ✅ added
                 },
             })
 
-        # ---- 2. One chunk per table -----------------------------------------
+        # ---- 2. Table chunks ---------------------------------------------
         for idx, table in enumerate(tables):
             tbl_text = table_to_text(table)
             table_id = table.get("table_id", f"table_{idx}")
 
-            # Include section title as context prefix so the embedding
-            # knows WHAT the table is about, not just raw numbers.
             contextualised = (
                 f"Section {sec_id} – {title}\n"
                 f"{tbl_text}"
             )
 
             chunks.append({
-                "id"  : next_id(f"tbl_{sec_id}_{idx}_{table_id}"),
+                "id": next_id(f"tbl_{sec_id}_{idx}_{table_id}"),
                 "text": contextualised,
                 "metadata": {
                     "chunk_type": "table",
-                    "section"   : sec_id,
-                    "title"     : title,
-                    "parent"    : parent,
-                    "table_id"  : table_id,
+                    "section": sec_id,
+                    "title": title,
+                    "parent": parent,
+                    "table_id": table_id,
                     "has_tables": "true",
+                    "label": label,   # ✅ added
                 },
             })
 
@@ -147,24 +139,25 @@ def main(parsed_file: str, db_dir: str = "chroma_db"):
         sections = json.load(f)
 
     chunks = build_chunks(sections)
+
     print(f"Built {len(chunks)} chunks  "
           f"({sum(1 for c in chunks if c['metadata']['chunk_type']=='section')} section, "
           f"{sum(1 for c in chunks if c['metadata']['chunk_type']=='table')} table)")
 
     # ---- Embed ------------------------------------------------------------
-    model      = SentenceTransformer("all-MiniLM-L6-v2")
-    texts      = [c["text"] for c in chunks]
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    texts = [c["text"] for c in chunks]
     embeddings = model.encode(texts, show_progress_bar=True).tolist()
 
     # ---- Store ------------------------------------------------------------
-    client     = chromadb.PersistentClient(path=db_dir)
+    client = chromadb.PersistentClient(path=db_dir)
     collection = client.get_or_create_collection("sections")
 
     collection.upsert(
-        ids        = [c["id"]       for c in chunks],
-        embeddings = embeddings,
-        documents  = texts,
-        metadatas  = [c["metadata"] for c in chunks],
+        ids=[c["id"] for c in chunks],
+        embeddings=embeddings,
+        documents=texts,
+        metadatas=[c["metadata"] for c in chunks],
     )
 
     print(f"✅ {len(chunks)} chunks stored in ChromaDB at './{db_dir}'")
@@ -180,5 +173,5 @@ if __name__ == "__main__":
         sys.exit(1)
 
     parsed_file = sys.argv[1]
-    db_dir      = sys.argv[2] if len(sys.argv) > 2 else "chroma_db"
+    db_dir = sys.argv[2] if len(sys.argv) > 2 else "chroma_db"
     main(parsed_file, db_dir)
