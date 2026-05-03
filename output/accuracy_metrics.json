@@ -1,62 +1,99 @@
 {
   "purpose": {
-    "score": 0.0513,
-    "n_chunks": 10,
-    "n_table_chunks": 2,
-    "best_chunk": "5.1.2.1"
+    "jaccard": 0.0733,
+    "n_chunks": 16,
+    "n_table_chunks": 0,
+    "best_chunk": "",
+    "bert_f1": 0.8276,
+    "bert_p": 0.8567,
+    "bert_r": 0.8005
   },
   "scope": {
-    "score": 0.0389,
-    "n_chunks": 10,
-    "n_table_chunks": 2,
-    "best_chunk": "5.6.7"
+    "jaccard": 0.0504,
+    "n_chunks": 16,
+    "n_table_chunks": 0,
+    "best_chunk": "",
+    "bert_f1": 0.8207,
+    "bert_p": 0.8361,
+    "bert_r": 0.8058
   },
   "acronyms": {
-    "score": 0.1018,
-    "n_chunks": 8,
-    "n_table_chunks": 0,
-    "best_chunk": "4.1.2.2"
+    "jaccard": 0.0415,
+    "n_chunks": 16,
+    "n_table_chunks": 2,
+    "best_chunk": "",
+    "bert_f1": 0.8164,
+    "bert_p": 0.8393,
+    "bert_r": 0.7948
   },
   "references": {
-    "score": 0.04,
-    "n_chunks": 9,
-    "n_table_chunks": 2,
-    "best_chunk": "4.1.2"
+    "jaccard": 0.0467,
+    "n_chunks": 16,
+    "n_table_chunks": 0,
+    "best_chunk": "",
+    "bert_f1": 0.79,
+    "bert_p": 0.7868,
+    "bert_r": 0.7931
   },
   "procedure": {
-    "score": 0.1199,
-    "n_chunks": 10,
+    "jaccard": 0.0932,
+    "n_chunks": 16,
     "n_table_chunks": 0,
-    "best_chunk": "5.9.2.1"
+    "best_chunk": "",
+    "bert_f1": 0.8439,
+    "bert_p": 0.8484,
+    "bert_r": 0.8394
   },
   "equipment": {
-    "score": 0.1061,
-    "n_chunks": 10,
+    "jaccard": 0.0706,
+    "n_chunks": 16,
     "n_table_chunks": 0,
-    "best_chunk": "5.9.6.4"
+    "best_chunk": "",
+    "bert_f1": 0.7882,
+    "bert_p": 0.7719,
+    "bert_r": 0.8052
   },
   "personnel": {
-    "score": 0.1011,
-    "n_chunks": 9,
-    "n_table_chunks": 2,
-    "best_chunk": "5.11.4.4"
+    "jaccard": 0.0641,
+    "n_chunks": 16,
+    "n_table_chunks": 1,
+    "best_chunk": "",
+    "bert_f1": 0.8415,
+    "bert_p": 0.8546,
+    "bert_r": 0.8289
   },
   "quality": {
-    "score": 0.1086,
-    "n_chunks": 10,
+    "jaccard": 0.1143,
+    "n_chunks": 16,
     "n_table_chunks": 2,
-    "best_chunk": "5.11.5"
+    "best_chunk": "",
+    "bert_f1": 0.8285,
+    "bert_p": 0.8344,
+    "bert_r": 0.8227
   },
   "health_safety": {
-    "score": 0.0626,
-    "n_chunks": 6,
-    "n_table_chunks": 2,
-    "best_chunk": "4.2.10.3"
+    "jaccard": 0.0614,
+    "n_chunks": 16,
+    "n_table_chunks": 4,
+    "best_chunk": "",
+    "bert_f1": 0.8448,
+    "bert_p": 0.8794,
+    "bert_r": 0.8128
   },
   "other": {
-    "score": 0.1205,
-    "n_chunks": 10,
-    "n_table_chunks": 1,
-    "best_chunk": "5.8.3.6"
+    "jaccard": 0.0739,
+    "n_chunks": 16,
+    "n_table_chunks": 0,
+    "best_chunk": "",
+    "bert_f1": 0.8574,
+    "bert_p": 0.8818,
+    "bert_r": 0.8343
+  },
+  "_summary": {
+    "avg_jaccard": 0.0689,
+    "avg_bert_f1": 0.8259,
+    "embedding_model": "all-MiniLM-L12-v2",
+    "llm_model": "llama-3.3-70b-versatile (Groq)",
+    "n_sections": 10
   }
 }

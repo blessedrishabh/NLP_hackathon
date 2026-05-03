@@ -92,3 +92,30 @@ coverage/
 # END OF BASE. ADD LANGUAGE-SPECIFIC RULES BELOW
 # Examples: node_modules/ (Node), __pycache__/ (Python), target/ (Java/Rust)
 # ==============================================================================
+
+# --- Node.js ---
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.npm/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Project-Specific ---
+# Exclude chroma_db and output directories during development (comment out if needed)
+# chroma_db/
+# output/
+# parsed_sections.json

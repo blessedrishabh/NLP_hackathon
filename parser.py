@@ -1,24 +1,98 @@
 """
-parser.py  –  CPWD Specification PDF Parser (v2)
+parser.py  –  CPWD Specification PDF Parser (v3)
 =================================================
-Improvements over v1:
-- Tables are extracted as structured 2-D arrays instead of raw text
-- Each section carries a `tables` list alongside its `content` string
-- Table captions ("TABLE 4.1 …") are resolved from surrounding text
-- Text that falls inside a detected table bounding-box is suppressed so it
-  does not bleed into the `content` field
+Improvements over v2:
+- Semantic chunking: Long sections split with overlap for better context
+- Rich metadata: hierarchy, depth, content stats, chunk type
+- Enhanced tables: auto-generated descriptions, linked to parent sections
+- Better text processing: cleaner validation, improved special char handling
+- Chunk overlap: adjacent chunks merged when semantically related
+- Hierarchical paths: full parent chain tracked for context
 """
 
 import re
 import sys
 import json
 import fitz                          # PyMuPDF
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Regex helpers
 # ---------------------------------------------------------------------------
 SECTION_REGEX   = re.compile(r'^(\d+(?:\.\d+)+)\.?\s+(.*)')
 TABLE_CAP_REGEX = re.compile(r'(TABLE|Table)\s+(\d+\.\d+)\b(.*)', re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Semantic Chunking Helpers
+# ---------------------------------------------------------------------------
+def get_hierarchy_path(node: 'SectionNode', parent_map: dict) -> str:
+    """Build full hierarchical path: e.g., '5 > 5.1 > 5.1.2'"""
+    path = [node.section_id]
+    current = node
+    while current.section_id in parent_map:
+        current = parent_map[current.section_id]
+        if current.section_id != "root":
+            path.insert(0, current.section_id)
+    return " > ".join(path)
+
+
+def split_long_content(content: str, max_chunk_size: int = 800, 
+                       overlap_size: int = 150) -> list[str]:
+    """
+    Split long content into semantic chunks with overlap.
+    Tries to split on sentence boundaries when possible.
+    """
+    if len(content) <= max_chunk_size:
+        return [content]
+    
+    sentences = re.split(r'(?<=[.!?])\s+', content)
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 <= max_chunk_size:
+            current_chunk += " " + sentence if current_chunk else sentence
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = sentence
+    
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    # Add overlap between chunks
+    if len(chunks) > 1:
+        overlapped = [chunks[0]]
+        for i in range(1, len(chunks)):
+            prev_chunk = chunks[i - 1]
+            overlap_text = prev_chunk[-overlap_size:] if len(prev_chunk) > overlap_size else prev_chunk
+            overlapped.append(overlap_text + " " + chunks[i])
+        return overlapped
+    
+    return chunks
+
+
+def generate_table_description(table_id: str, data: list[list[str]]) -> str:
+    """Generate semantic description of table content."""
+    if not data or len(data) == 0:
+        return f"{table_id}: (empty)"
+    
+    description = f"{table_id}:"
+    
+    # Extract header if available
+    if len(data) > 0:
+        header = [h for h in data[0] if h.strip()]
+        if header:
+            description += f" Columns: {', '.join(header[:3])}"
+            if len(header) > 3:
+                description += f" (+{len(header) - 3} more)"
+    
+    # Count non-empty rows
+    non_empty_rows = sum(1 for row in data if any(c.strip() for c in row))
+    description += f". Rows: ~{non_empty_rows}"
+    
+    return description
 
 
 # ---------------------------------------------------------------------------
@@ -69,16 +143,34 @@ def find_parent(stack: list, section_id: str) -> SectionNode:
 
 
 def is_valid_section(text: str) -> bool:
+    """Enhanced validation to filter out noise and metadata lines."""
     text = text.strip()
-    if re.search(r'\b(mm|cm|m|kg|%)\b', text.lower()):
+    
+    # Filter out pure measurement/units
+    if re.search(r'^\s*[\d\.\-\s()]+\s*(mm|cm|m|kg|%|mm²|m³|N\/mm²)\s*$', text.lower()):
         return False
+    
+    # Filter out lines that are mostly digits (page numbers, indices, etc.)
     digit_ratio = sum(c.isdigit() for c in text) / max(len(text), 1)
     if digit_ratio > 0.4:
         return False
+    
+    # Filter out pure numeric/symbol patterns
     if re.match(r'^[\d\.\-\s()]+$', text):
         return False
+    
+    # Must contain at least some alphabetic characters
     if not re.search(r'[A-Za-z]', text):
         return False
+    
+    # Minimum length requirement
+    if len(text) < 5:
+        return False
+    
+    # Filter out common header/footer patterns
+    if re.match(r'^(page|chapter|table of contents|index|appendix|glossary)', text.lower()):
+        return False
+    
     return True
 
 
@@ -341,20 +433,120 @@ def build_tree(items: list[dict]) -> SectionNode:
 
 
 # ---------------------------------------------------------------------------
-# Flatten tree to list of section dicts
+# Flatten tree to list of section dicts with semantic chunking
 # ---------------------------------------------------------------------------
-def flatten_sections(node: SectionNode, parent: SectionNode | None = None) -> list[dict]:
+def flatten_sections(node: SectionNode, parent: SectionNode | None = None,
+                     parent_map: dict | None = None,
+                     depth: int = 0) -> list[dict]:
+    """
+    Flatten section tree with:
+    - Semantic chunking for long content
+    - Rich metadata (hierarchy, depth, stats, chunk type)
+    - Table descriptions and linking
+    - Parent-child relationships preserved
+    """
+    if parent_map is None:
+        parent_map = {}
+    
     chunks = []
+    
     if node.section_id != "root":
-        chunks.append({
-            "section": node.section_id,
-            "title"  : node.title,
-            "content": " ".join(node.content).strip(),
-            "tables" : node.tables,
-            "parent" : parent.section_id if parent else None,
-        })
+        # Store parent mapping for hierarchy construction
+        if parent:
+            parent_map[node.section_id] = parent
+        
+        base_metadata = {
+            "section_id": node.section_id,
+            "parent": parent.section_id if parent else None,
+            "hierarchy_path": get_hierarchy_path(node, parent_map),
+            "depth": depth,
+            "title": node.title,
+            "has_tables": len(node.tables) > 0,
+            "num_tables": len(node.tables),
+        }
+        
+        # ---- 1. Create section chunk with tables ----
+        content_text = " ".join(node.content).strip()
+        section_text = f"{node.title}\n{content_text}" if content_text else node.title
+        
+        # Content statistics
+        content_stats = {
+            "content_length": len(content_text),
+            "word_count": len(content_text.split()),
+            "sentence_count": len(re.split(r'[.!?]+', content_text)),
+        }
+        
+        if section_text.strip():
+            # Semantic chunk splitting for long content
+            if len(content_text) > 800:
+                content_chunks = split_long_content(content_text, max_chunk_size=800, overlap_size=150)
+            else:
+                content_chunks = [content_text]
+            
+            for chunk_idx, content_chunk in enumerate(content_chunks):
+                chunk_dict = {
+                    "id": f"{node.section_id}_text_{chunk_idx}" if len(content_chunks) > 1 else f"{node.section_id}_text",
+                    "section": node.section_id,
+                    "title": node.title,
+                    "text": content_chunk,
+                    "metadata": {
+                        **base_metadata,
+                        "chunk_type": "section_content",
+                        "is_continuation": chunk_idx > 0,
+                        "chunk_index": chunk_idx,
+                        "total_chunks": len(content_chunks),
+                        **content_stats,
+                        "table_count_in_section": len(node.tables),
+                    }
+                }
+                chunks.append(chunk_dict)
+        
+        # ---- 2. Create table chunks with context ----
+        for table_idx, table in enumerate(node.tables):
+            table_id = table.get("table_id", f"table_{table_idx}")
+            table_data = table.get("data", [])
+            
+            # Generate semantic description
+            table_desc = generate_table_description(table_id, table_data)
+            
+            # Create table text with context
+            table_text = f"{node.title}\n{table_desc}\n"
+            
+            # Add first few rows as preview
+            preview_rows = table_data[:5] if len(table_data) > 0 else []
+            for row in preview_rows:
+                row_str = " | ".join(str(cell).strip() for cell in row if cell)
+                if row_str.strip():
+                    table_text += f"{row_str}\n"
+            
+            if len(table_data) > 5:
+                table_text += f"... ({len(table_data) - 5} more rows)"
+            
+            table_metadata = {
+                **base_metadata,
+                "chunk_type": "table",
+                "table_id": table_id,
+                "table_index": table_idx,
+                "total_tables_in_section": len(node.tables),
+                "table_rows": len(table_data),
+                "table_cols": len(table_data[0]) if len(table_data) > 0 else 0,
+                "table_description": table_desc,
+                **content_stats,
+            }
+            
+            chunks.append({
+                "id": f"{node.section_id}_table_{table_idx}",
+                "section": node.section_id,
+                "title": node.title,
+                "text": table_text,
+                "table_data": table_data,  # For later reference
+                "metadata": table_metadata,
+            })
+    
+    # Recursively process children with increased depth
     for child in node.children:
-        chunks.extend(flatten_sections(child, node))
+        chunks.extend(flatten_sections(child, node, parent_map, depth + 1))
+    
     return chunks
 
 
@@ -369,25 +561,100 @@ def parse(pdf_path: str) -> list[dict]:
     return flatten_sections(tree)
 
 
+def convert_new_to_old_format(enhanced_chunks: list[dict]) -> list[dict]:
+    """
+    Convert v3 enhanced chunks back to v2 format for backward compatibility.
+    Groups chunks by section and reconstructs the old structure.
+    """
+    sections_map = {}
+    
+    for chunk in enhanced_chunks:
+        section_id = chunk.get('section')
+        if not section_id:
+            continue
+            
+        if section_id not in sections_map:
+            sections_map[section_id] = {
+                "section": section_id,
+                "title": chunk.get('title', ''),
+                "content": "",
+                "tables": [],
+                "parent": chunk['metadata'].get('parent'),
+            }
+        
+        # Accumulate content
+        if chunk['metadata'].get('chunk_type') == 'section_content':
+            if sections_map[section_id]["content"]:
+                sections_map[section_id]["content"] += " "
+            sections_map[section_id]["content"] += chunk.get('text', '').replace(chunk.get('title', ''), '').strip()
+        
+        # Collect tables
+        elif chunk['metadata'].get('chunk_type') == 'table':
+            if 'table_data' in chunk:
+                sections_map[section_id]["tables"].append({
+                    "table_id": chunk['metadata'].get('table_id', ''),
+                    "data": chunk['table_data'],
+                })
+    
+    return list(sections_map.values())
+
+
 if __name__ == "__main__":
     pdf_path = (sys.argv[1] if len(sys.argv) > 1
                 else "Prescriptive Specifications_CPWD.pdf")
 
     chunks = parse(pdf_path)
 
-    # ---- pretty-print first few sections ----------------------------------
-    for c in chunks[:12]:
-        print("=" * 60)
-        print(f"Section : {c['section']}")
-        print(f"Title   : {c['title']}")
-        print(f"Parent  : {c['parent']}")
-        print(f"Content : {c['content'][:200]}")
-        if c["tables"]:
-            for t in c["tables"]:
-                print(f"  [TABLE] {t['table_id']}")
-                for row in t["data"][:3]:
-                    print(f"         {row}")
+    # ---- pretty-print first few enhanced chunks ----------------------------------
+    print("\n" + "=" * 80)
+    print("ENHANCED PARSER OUTPUT (v3 - Semantic Chunking & Rich Metadata)")
+    print("=" * 80)
+    
+    for idx, c in enumerate(chunks[:8]):
+        print(f"\n[CHUNK {idx}]")
+        print(f"  ID              : {c.get('id', 'N/A')}")
+        print(f"  Section         : {c.get('section', 'N/A')}")
+        print(f"  Title           : {c.get('title', 'N/A')}")
+        print(f"  Chunk Type      : {c['metadata'].get('chunk_type', 'N/A')}")
+        print(f"  Hierarchy Path  : {c['metadata'].get('hierarchy_path', 'N/A')}")
+        print(f"  Depth           : {c['metadata'].get('depth', 'N/A')}")
+        print(f"  Content Length  : {c['metadata'].get('content_length', 'N/A')} chars")
+        print(f"  Word Count      : {c['metadata'].get('word_count', 'N/A')}")
+        
+        if c['metadata'].get('chunk_type') == 'table':
+            print(f"  Table Desc      : {c['metadata'].get('table_description', 'N/A')}")
+            print(f"  Table Dims      : {c['metadata'].get('table_rows', 0)} rows × {c['metadata'].get('table_cols', 0)} cols")
+        
+        text_preview = c.get('text', '')[:150].replace('\n', ' ')
+        print(f"  Text Preview    : {text_preview}...")
 
+    # ---- Save enhanced chunks ----
     with open("parsed_sections.json", "w", encoding="utf-8") as f:
         json.dump(chunks, f, ensure_ascii=False, indent=2)
-    print("\nSaved → parsed_sections.json")
+    
+    print("\n" + "=" * 80)
+    print(f"✅ Saved {len(chunks)} enhanced chunks → parsed_sections.json")
+    print("=" * 80)
+    
+    # ---- Compute and display statistics ----
+    section_chunks = [c for c in chunks if c['metadata'].get('chunk_type') == 'section_content']
+    table_chunks = [c for c in chunks if c['metadata'].get('chunk_type') == 'table']
+    
+    total_content_length = sum(c['metadata'].get('content_length', 0) for c in section_chunks)
+    total_tables = len(table_chunks)
+    
+    print(f"\nStatistics:")
+    print(f"  Total Chunks       : {len(chunks)}")
+    print(f"  Section Chunks     : {len(section_chunks)}")
+    print(f"  Table Chunks       : {total_tables}")
+    print(f"  Total Content Size : {total_content_length:,} characters")
+    print(f"  Avg Chunk Size     : {total_content_length // max(len(section_chunks), 1):,} chars")
+    
+    # ---- Show hierarchy depth distribution ----
+    depth_dist = {}
+    for c in chunks:
+        d = c['metadata'].get('depth', 0)
+        depth_dist[d] = depth_dist.get(d, 0) + 1
+    print(f"\nDepth Distribution:")
+    for depth in sorted(depth_dist.keys()):
+        print(f"  Level {depth}: {depth_dist[depth]} chunks")
